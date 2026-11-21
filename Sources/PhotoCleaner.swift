@@ -1,5 +1,6 @@
 import SwiftUI
 import Photos
+import PhotosUI
 import AVKit
 
 // MARK: - App
@@ -1304,7 +1305,7 @@ struct StillView: View {
 }
 
 final class PlayerUIView: UIView {
-    override static var layerClass: AnyClass { AVPlayerLayer.self }
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }
 
