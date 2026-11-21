@@ -40,6 +40,17 @@ struct Rec: Codable {
     var mod: Double       // modification date, to detect edits
     var blur: Float?      // Laplacian variance (low = blurry)
     var hash: String?     // dHash hex; "-" = could not analyze
+    var size: Int64 { SizeMode.countICloud ? total : local }
+}
+
+/// Global display switches (mirrors the Settings toggles).
+enum SizeMode {
+    static var countICloud = UserDefaults.standard.object(forKey: "countICloud") as? Bool ?? true
+    static var allowDownloads = UserDefaults.standard.bool(forKey: "allowDownloads")
+    static func sync(_ count: Bool, _ downloads: Bool) {
+        countICloud = count
+        allowDownloads = downloads
+    }
 }
 
 struct MediaItem: Identifiable, Hashable, @unchecked Sendable {
@@ -47,6 +58,9 @@ struct MediaItem: Identifiable, Hashable, @unchecked Sendable {
     let asset: PHAsset
     let local: Int64
     let total: Int64
+
+    /// Size shown and sorted by: includes iCloud-only parts when that setting is on.
+    var size: Int64 { SizeMode.countICloud ? total : local }
 
     var isVideo: Bool { asset.mediaType == .video }
     var isScreenshot: Bool { asset.mediaSubtypes.contains(.photoScreenshot) }
@@ -263,10 +277,10 @@ enum DuplicateFinder {
         }
         var roots: [Int: [MediaItem]] = [:]
         for i in 0..<c.count { roots[find(i), default: []].append(c[i].item) }
-        var result = roots.values.filter { $0.count > 1 }.map { $0.sorted { $0.local > $1.local } }
+        var result = roots.values.filter { $0.count > 1 }.map { $0.sorted { $0.size > $1.size } }
         result.sort { a, b in
-            let sa = a.dropFirst().reduce(Int64(0)) { $0 + $1.local }
-            let sb = b.dropFirst().reduce(Int64(0)) { $0 + $1.local }
+            let sa = a.dropFirst().reduce(Int64(0)) { $0 + $1.size }
+            let sb = b.dropFirst().reduce(Int64(0)) { $0 + $1.size }
             return sa > sb
         }
         return result
@@ -555,7 +569,7 @@ final class LibraryModel: ObservableObject {
     func delete(ids: Set<String>) async -> Int64? {
         let targets = items.filter { ids.contains($0.id) }
         guard !targets.isEmpty else { return 0 }
-        let freed = targets.reduce(Int64(0)) { $0 + $1.local }
+        let freed = targets.reduce(Int64(0)) { $0 + $1.size }
         let assets = targets.map(\.asset)
         do {
             try await PHPhotoLibrary.shared().performChanges {
@@ -583,6 +597,7 @@ struct Sig: Equatable {
     var sort: SortKey = .size
     var desc = true
     var blur = 0.0
+    var countICloud = true
 }
 
 final class ListCache {
@@ -605,6 +620,8 @@ struct ContentView: View {
 
     @AppStorage("refreshOnLaunch") private var refreshOnLaunch = false
     @AppStorage("blurThreshold") private var blurThreshold = 60.0
+    @AppStorage("countICloud") private var countICloud = true
+    @AppStorage("allowDownloads") private var allowDownloads = false
 
     @State private var pageID: MediaFilter? = .all
     @State private var sortKey: SortKey = .size
@@ -623,7 +640,7 @@ struct ContentView: View {
 
     private func sections(for f: MediaFilter) -> [SectionData] {
         let sig = Sig(version: model.version, analysisVersion: model.analysisVersion,
-                      sort: sortKey, desc: descending, blur: blurThreshold)
+                      sort: sortKey, desc: descending, blur: blurThreshold, countICloud: countICloud)
         if cache.sig != sig {
             cache.d.removeAll()
             cache.sig = sig
@@ -642,7 +659,7 @@ struct ContentView: View {
         case .photos: return !it.isVideo && !it.isScreenshot
         case .live: return it.isLive
         case .burst: return it.isBurst
-        case .big: return it.local > 50_000_000
+        case .big: return it.size > 50_000_000
         case .blurry:
             guard !it.isVideo, !it.isScreenshot, let b = model.blur(of: it.id) else { return false }
             return b < Float(blurThreshold)
@@ -653,7 +670,7 @@ struct ContentView: View {
     private func buildSections(_ f: MediaFilter) -> [SectionData] {
         if f == .duplicates {
             return model.dupGroups.enumerated().map { i, g in
-                let extra = g.dropFirst().reduce(Int64(0)) { $0 + $1.local }
+                let extra = g.dropFirst().reduce(Int64(0)) { $0 + $1.size }
                 return SectionData(
                     id: "dup-\(i)",
                     title: "Group \(i + 1) · \(g.count) photos · \(formatBytes(extra)) extra",
@@ -664,7 +681,7 @@ struct ContentView: View {
         let base = model.items.filter { include($0, f) }
         let sorted = base.sorted {
             switch sortKey {
-            case .size: return descending ? $0.local > $1.local : $0.local < $1.local
+            case .size: return descending ? $0.size > $1.size : $0.size < $1.size
             case .date: return descending ? $0.date > $1.date : $0.date < $1.date
             }
         }
@@ -672,12 +689,13 @@ struct ContentView: View {
     }
 
     private var selectedBytes: Int64 {
-        selection.reduce(Int64(0)) { $0 + (model.recs[$1]?.local ?? 0) }
+        selection.reduce(Int64(0)) { $0 + (model.recs[$1]?.size ?? 0) }
     }
 
     // MARK: Body
 
     var body: some View {
+        let _ = SizeMode.sync(countICloud, allowDownloads)
         NavigationStack {
             Group {
                 if model.denied {
@@ -723,6 +741,7 @@ struct ContentView: View {
             .onChange(of: pageID) { _, new in
                 if new == .blurry || new == .duplicates { model.startAnalysis() }
             }
+            .onChange(of: countICloud) { _, _ in model.refreshDuplicates() }
             .fullScreenCover(item: $preview) { req in
                 PreviewView(model: model, toaster: toaster, list: req.list, index: req.index)
             }
@@ -890,8 +909,8 @@ struct GridPage: View {
 
     private var summary: String {
         let all = flat
-        let bytes = all.reduce(Int64(0)) { $0 + $1.local }
-        return "\(all.count) items · \(formatBytes(bytes)) on this iPhone"
+        let bytes = all.reduce(Int64(0)) { $0 + $1.size }
+        return "\(all.count) items · \(formatBytes(bytes))\(SizeMode.countICloud ? " incl. iCloud" : " on this iPhone")"
     }
 
     var body: some View {
@@ -1027,7 +1046,7 @@ struct Cell: View {
                     if item.local < item.total {
                         Image(systemName: "icloud").font(.system(size: 9))
                     }
-                    Text(item.local == 0 && item.total > 0 ? "iCloud" : formatBytes(item.local))
+                    Text(item.size == 0 && item.total > 0 ? "iCloud" : formatBytes(item.size))
                         .font(.caption2.bold())
                 }
                 .padding(.horizontal, 5).padding(.vertical, 2)
@@ -1112,6 +1131,7 @@ struct PreviewView: View {
     @State private var list: [MediaItem]
     @State private var index: Int
     @State private var dragY: CGFloat = 0
+    @State private var zoom: CGFloat = 1
     @State private var parts: [Part] = []
     @Environment(\.dismiss) private var dismiss
 
@@ -1139,6 +1159,7 @@ struct PreviewView: View {
         .overlay(alignment: .top) { topBar }
         .overlay(alignment: .bottom) { bottomPanel }
         .toastLayer(toaster)
+        .onChange(of: current?.id) { _, _ in zoom = 1 }
         .task(id: current?.id) {
             if let c = current { parts = LibraryModel.breakdown(of: c.asset) } else { parts = [] }
         }
@@ -1149,13 +1170,18 @@ struct PreviewView: View {
     private func media(_ item: MediaItem) -> some View {
         if item.isVideo {
             VideoView(asset: item.asset)
-        } else if item.isLive {
-            ZStack {
-                StillView(asset: item.asset)
-                LivePhotoPlayer(asset: item.asset)
-            }
         } else {
-            StillView(asset: item.asset)
+            // Photos, screenshots and Live Photos: pinch / double-tap to zoom, drag to pan.
+            ZoomView(scale: $zoom) {
+                ZStack {
+                    StillView(asset: item.asset, highRes: zoom > 1.5)
+                    if item.isLive {
+                        LivePhotoPlayer(asset: item.asset)
+                            .opacity(zoom > 1.01 ? 0 : 1)
+                            .allowsHitTesting(zoom <= 1.01)
+                    }
+                }
+            }
         }
     }
 
@@ -1163,11 +1189,13 @@ struct PreviewView: View {
     private var dragGesture: some Gesture {
         DragGesture(minimumDistance: 12)
             .onChanged { v in
+                if zoom > 1.01 { return }
                 if abs(v.translation.height) > abs(v.translation.width), v.translation.height > 0 {
                     dragY = v.translation.height
                 }
             }
             .onEnded { v in
+                if zoom > 1.01 { return }
                 let dx = v.translation.width
                 let dy = v.translation.height
                 if abs(dy) > abs(dx), dy > 140 || v.predictedEndTranslation.height > 450 {
@@ -1205,10 +1233,10 @@ struct PreviewView: View {
         VStack(spacing: 10) {
             if let item = current {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Total on this iPhone: \(formatBytes(item.local))")
+                    Text("Size: \(formatBytes(item.size))")
                         .font(.headline)
                     if item.total > item.local {
-                        Text("Incl. iCloud-only parts: \(formatBytes(item.total))")
+                        Text("On this iPhone: \(formatBytes(item.local)) · iCloud only: \(formatBytes(item.total - item.local))")
                             .font(.caption)
                     }
                     ForEach(parts) { p in
@@ -1267,12 +1295,83 @@ struct PreviewView: View {
     }
 }
 
-// MARK: - Media views (all local: network access disabled)
+// MARK: - Zoom container
+
+struct ZoomView<Content: View>: View {
+    @Binding var scale: CGFloat
+    let content: Content
+
+    init(scale: Binding<CGFloat>, @ViewBuilder content: () -> Content) {
+        _scale = scale
+        self.content = content()
+    }
+
+    @State private var base: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        GeometryReader { geo in
+            content
+                .frame(width: geo.size.width, height: geo.size.height)
+                .scaleEffect(scale)
+                .offset(offset)
+                // Panning only while zoomed in, so swipe-down / swipe-sideways still work at 1x.
+                .gesture(
+                    DragGesture()
+                        .onChanged { v in
+                            offset = clamp(CGSize(width: lastOffset.width + v.translation.width,
+                                                  height: lastOffset.height + v.translation.height),
+                                           geo.size)
+                        }
+                        .onEnded { _ in lastOffset = offset },
+                    including: scale > 1.01 ? .all : .subviews
+                )
+                .simultaneousGesture(
+                    MagnifyGesture()
+                        .onChanged { v in
+                            scale = min(max(base * v.magnification, 1), 6)
+                            offset = clamp(offset, geo.size)
+                        }
+                        .onEnded { _ in
+                            base = scale
+                            if scale < 1.05 {
+                                withAnimation(.spring(duration: 0.25)) { reset() }
+                            } else {
+                                lastOffset = offset
+                            }
+                        }
+                )
+                .onTapGesture(count: 2) {
+                    withAnimation(.spring(duration: 0.3)) {
+                        if scale > 1.01 { reset() } else { scale = 2.5; base = 2.5 }
+                    }
+                }
+        }
+    }
+
+    private func reset() {
+        scale = 1
+        base = 1
+        offset = .zero
+        lastOffset = .zero
+    }
+
+    private func clamp(_ o: CGSize, _ size: CGSize) -> CGSize {
+        let mx = size.width * (scale - 1) / 2
+        let my = size.height * (scale - 1) / 2
+        return CGSize(width: min(max(o.width, -mx), mx), height: min(max(o.height, -my), my))
+    }
+}
+
+// MARK: - Media views (thumbnails/analysis never use the network)
 
 struct StillView: View {
     let asset: PHAsset
+    var highRes: Bool = false
     @State private var image: UIImage?
     @State private var missing = false
+    @State private var loadedHi = false
 
     var body: some View {
         ZStack {
@@ -1289,7 +1388,7 @@ struct StillView: View {
         .onAppear {
             let opts = PHImageRequestOptions()
             opts.deliveryMode = .opportunistic
-            opts.isNetworkAccessAllowed = false
+            opts.isNetworkAccessAllowed = SizeMode.allowDownloads
             PHImageManager.default().requestImage(
                 for: asset,
                 targetSize: CGSize(width: 1600, height: 1600),
@@ -1297,7 +1396,25 @@ struct StillView: View {
                 options: opts
             ) { img, _ in
                 DispatchQueue.main.async {
-                    if let img { image = img } else if image == nil { missing = true }
+                    if let img { if !loadedHi { image = img } } else if image == nil { missing = true }
+                }
+            }
+        }
+        // Zoomed in: swap to a sharper image (up to 4096 px) once.
+        .onChange(of: highRes) { _, hi in
+            guard hi, !loadedHi else { return }
+            loadedHi = true
+            let opts = PHImageRequestOptions()
+            opts.deliveryMode = .highQualityFormat
+            opts.isNetworkAccessAllowed = SizeMode.allowDownloads
+            PHImageManager.default().requestImage(
+                for: asset,
+                targetSize: CGSize(width: 4096, height: 4096),
+                contentMode: .aspectFit,
+                options: opts
+            ) { img, _ in
+                DispatchQueue.main.async {
+                    if let img { image = img } else { loadedHi = false }
                 }
             }
         }
@@ -1344,7 +1461,7 @@ struct VideoView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             let opts = PHVideoRequestOptions()
-            opts.isNetworkAccessAllowed = false
+            opts.isNetworkAccessAllowed = SizeMode.allowDownloads
             PHImageManager.default().requestPlayerItem(forVideo: asset, options: opts) { item, _ in
                 DispatchQueue.main.async {
                     if let item {
@@ -1375,7 +1492,7 @@ struct LivePhotoPlayer: UIViewRepresentable {
                                                       action: #selector(Coordinator.tap(_:))))
         let opts = PHLivePhotoRequestOptions()
         opts.deliveryMode = .highQualityFormat
-        opts.isNetworkAccessAllowed = false
+        opts.isNetworkAccessAllowed = SizeMode.allowDownloads
         PHImageManager.default().requestLivePhoto(
             for: asset,
             targetSize: CGSize(width: 1400, height: 1400),
@@ -1412,11 +1529,22 @@ struct SettingsView: View {
 
     @AppStorage("refreshOnLaunch") private var refreshOnLaunch = false
     @AppStorage("blurThreshold") private var blurThreshold = 60.0
+    @AppStorage("countICloud") private var countICloud = true
+    @AppStorage("allowDownloads") private var allowDownloads = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Toggle("Count iCloud items in sizes", isOn: $countICloud)
+                    Toggle("Download iCloud originals in preview", isOn: $allowDownloads)
+                } header: {
+                    Text("iCloud")
+                } footer: {
+                    Text("Count iCloud items: sizes and sorting include parts that live only in iCloud (marked with a cloud icon); deleting a photo removes it from iCloud too. Download originals: lets the preview fetch full-quality iCloud photos and videos. This is the only feature that uses the network, and it is off by default.")
+                }
+
                 Section {
                     Toggle("Refresh on launch", isOn: $refreshOnLaunch)
                     Button("Refresh now") { onRefresh(); dismiss() }
@@ -1440,9 +1568,9 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Text("Sizes show the space each item really uses on this iPhone, including Live Photo video and edited versions. Parts stored only in iCloud count as 0.")
+                    Text("Sizes include Live Photo video and edited versions. With \"Count iCloud items\" off, parts stored only in iCloud count as 0.")
                         .font(.footnote)
-                    Text("Everything runs on this iPhone. The app never uses the network.")
+                    Text("Everything runs on this iPhone. The network is only used if you turn on iCloud downloads for previews.")
                         .font(.footnote)
                 } header: {
                     Text("About")
